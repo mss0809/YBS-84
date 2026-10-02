@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""Create, inspect, or upload a custom RGB565 background to a ZK/Bluetrum device.
+
+This reproduces the DEVICE_MODE_DIAL == 0 path in the decompiled FreeFit app.
+It is deliberately read-only by default: Bluetooth writes require --send.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+SERVICE_UUID = "6e40fc00-b5a3-f393-e0a9-e50e24dcca9e"
+WRITE_UUID = "6e40fc20-b5a3-f393-e0a9-e50e24dcca9e"
+NOTIFY_UUID = "6e40fc21-b5a3-f393-e0a9-e50e24dcca9e"
+ZK_DIAL = 0xE4
+QUERY_DIAL_INFO = bytes((ZK_DIAL, 0x53, 0x01, 0x00))
+
+
+@dataclass(frozen=True)
+class DialInfo:
+    mtu: int
+    width: int
+    height: int
+    corners: int
+    rotation: int
+
+
+def be16(value: int) -> bytes:
+    return struct.pack(">H", value)
+
+
+def be32(value: int) -> bytes:
+    return struct.pack(">I", value)
+
+
+def rgb565_be(image_path: Path, width: int, height: int, corners: int = 0) -> bytes:
+    """Center-crop, resize, and pack an image as Android's RGB565 big-endian bytes."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError as exc:
+        raise RuntimeError("Pillow is required: pip install -r tools/requirements.txt") from exc
+
+    if width <= 0 or height <= 0:
+        raise ValueError("width and height must be positive")
+    image = Image.open(image_path).convert("RGB")
+    scale = max(width / image.width, height / image.height)
+    resized = image.resize((round(image.width * scale), round(image.height * scale)), Image.Resampling.LANCZOS)
+    left = (resized.width - width) // 2
+    top = (resized.height - height) // 2
+    image = resized.crop((left, top, left + width, top + height))
+    if corners:
+        mask = Image.new("L", (width, height), 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, width - 1, height - 1), radius=corners, fill=255)
+        background = Image.new("RGB", (width, height), "black")
+        background.paste(image, mask=mask)
+        image = background
+
+    raw = bytearray(width * height * 2)
+    offset = 0
+    for red, green, blue in image.getdata():
+        pixel = ((red >> 3) << 11) | ((green >> 2) << 5) | (blue >> 3)
+        raw[offset : offset + 2] = be16(pixel)
+        offset += 2
+    return bytes(raw)
+
+
+def start_packet(payload: bytes, frame_size: int, dial_type: int, text_position: int, text_colour: int) -> bytes:
+    """Build the app's 20-byte E4 51 packet for its raw-RGB565 mode."""
+    if not 15 <= frame_size <= 0xFFFF:
+        raise ValueError("frame_size must be between 15 and 65535")
+    payload_size = frame_size - 14
+    packets = (len(payload) + payload_size - 1) // payload_size
+    if packets > 0xFFFF:
+        raise ValueError("image needs too many packets")
+    return b"".join(
+        (
+            bytes((ZK_DIAL, 0x51, 0x01, 0x00)),
+            be16(packets),
+            be32(len(payload)),
+            bytes((0x00,)),
+            be16(payload_size),
+            bytes((dial_type & 0xFF, 0x01, text_position & 0xFF, 0x00)),
+            be16(text_colour),
+            bytes((0x00,)),
+        )
+    )
+
+
+def data_packets(payload: bytes, frame_size: int):
+    """Yield fixed-size E4 52 packets, including the source app's zero padding/checksum."""
+    chunk_size = frame_size - 14
+    total = (len(payload) + chunk_size - 1) // chunk_size
+    for index in range(total):
+        offset = index * chunk_size
+        chunk = payload[offset : offset + chunk_size].ljust(chunk_size, b"\0")
+        packet_number = index + 1
+        final = 1 if packet_number == total else 0
+        prefix = bytearray(
+            bytes((ZK_DIAL, 0x52, 0x01, 0x02))
+            + be16(packet_number)
+            + be32(offset)
+            + bytes(((packet_number * 100) // total, final, 0x00, 0x00))
+        )
+        # Java sums bytes 0..14 while positions 12..14 are still zero, then writes the checksum.
+        checksum = (sum(prefix) + sum(chunk)) & 0xFFFF
+        prefix[12:14] = be16(checksum)
+        yield bytes(prefix) + chunk
+
+
+def parse_dial_info(value: bytes) -> DialInfo:
+    if len(value) < 19 or value[0:2] != bytes((ZK_DIAL, 0x53)):
+        raise ValueError("not an E4 53 dial-info notification")
+    rotation_code = value[19] if len(value) > 19 else 0
+    rotation = {0: 0, 1: 90, 2: 180, 3: 270}.get(rotation_code, 0)
+    return DialInfo(
+        mtu=int.from_bytes(value[11:13], "big"),
+        width=int.from_bytes(value[13:15], "big"),
+        height=int.from_bytes(value[15:17], "big"),
+        corners=int.from_bytes(value[17:19], "big"),
+        rotation=rotation,
+    )
+
+
+async def find_device(address: Optional[str], name: Optional[str]):
+    from bleak import BleakScanner
+
+    if address:
+        return address
+    if not name:
+        raise ValueError("provide --address, or use --scan / --name")
+    devices = await BleakScanner.discover(timeout=8)
+    matches = [device for device in devices if device.name and name.casefold() in device.name.casefold()]
+    if not matches:
+        raise RuntimeError(f"no BLE device name containing {name!r} found")
+    if len(matches) > 1:
+        raise RuntimeError("multiple matches: " + ", ".join(f"{d.name} ({d.address})" for d in matches))
+    return matches[0].address
+
+
+async def scan() -> None:
+    from bleak import BleakScanner
+
+    for device in await BleakScanner.discover(timeout=8):
+        # RSSI is not exposed on every Bleak backend/version, so keep scan portable.
+        print(f"{device.address}\t{device.name or '-'}")
+
+
+async def connect_and_query(address: str) -> tuple[object, asyncio.Queue[bytes], DialInfo]:
+    from bleak import BleakClient
+
+    queue: asyncio.Queue[bytes] = asyncio.Queue()
+    client = BleakClient(address)
+    await client.connect()
+
+    def on_notify(_: int, value: bytearray) -> None:
+        packet = bytes(value)
+        print("notify:", packet.hex(" "))
+        queue.put_nowait(packet)
+
+    await client.start_notify(NOTIFY_UUID, on_notify)
+    # FreeFit's Android code calls BluetoothGatt.writeCharacteristic() without
+    # changing the characteristic write type.  That is an ATT Write Request
+    # (response=True), not a Write Command.  Its `false` argument only means
+    # "do not split this write" in the bundled BLE library.
+    await client.write_gatt_char(WRITE_UUID, QUERY_DIAL_INFO, response=True)
+    while True:
+        value = await asyncio.wait_for(queue.get(), timeout=8)
+        if value[:2] == bytes((ZK_DIAL, 0x53)):
+            return client, queue, parse_dial_info(value)
+
+
+async def wait_for(queue: asyncio.Queue[bytes], command: int, timeout: float = 8) -> bytes:
+    while True:
+        value = await asyncio.wait_for(queue.get(), timeout=timeout)
+        if value[:2] == bytes((ZK_DIAL, command)):
+            return value
+
+
+async def inspect(address: str) -> None:
+    client = None
+    try:
+        client, _, info = await connect_and_query(address)
+        print(f"dial-info: mtu={info.mtu}, size={info.width}x{info.height}, corners={info.corners}, rotation={info.rotation}")
+        char = client.services.get_characteristic(WRITE_UUID)
+        stack_limit = getattr(char, "max_write_without_response_size", None)
+        if stack_limit is not None:
+            print(f"BLE write-without-response limit: {stack_limit} bytes")
+    finally:
+        if client:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+
+
+async def upload(args: argparse.Namespace, address: str) -> None:
+    client = None
+    try:
+        client, queue, info = await connect_and_query(address)
+        width = args.width or info.width
+        height = args.height or info.height
+        corners = args.corners if args.corners is not None else info.corners
+        if not width or not height or not info.mtu:
+            raise RuntimeError("device did not report usable dimensions/MTU; do not guess them")
+        # The Android app's reported MTU is the entire E4 52 packet size.
+        # Limit it to the desktop BLE stack's negotiated write-without-response limit.
+        char = client.services.get_characteristic(WRITE_UUID)
+        stack_limit = getattr(char, "max_write_without_response_size", info.mtu)
+        frame_size = min(info.mtu, stack_limit)
+        if frame_size < 15:
+            raise RuntimeError(f"negotiated BLE write size {frame_size} is too small")
+        pixels = rgb565_be(Path(args.image), width, height, corners)
+        start = start_packet(pixels, frame_size, args.dial_type, args.text_position, int(args.text_colour, 16))
+        packets = list(data_packets(pixels, frame_size))
+        print(f"uploading {width}x{height} RGB565 ({len(pixels)} bytes) in {len(packets)} packets, frame_size={frame_size}")
+        await client.write_gatt_char(WRITE_UUID, start, response=True)
+        reply = await wait_for(queue, 0x51)
+        if len(reply) > 2 and reply[2] > 2:
+            raise RuntimeError(f"device rejected start packet: {reply.hex(' ')}")
+        for number, packet in enumerate(packets, 1):
+            await client.write_gatt_char(WRITE_UUID, packet, response=True)
+            reply = await wait_for(queue, 0x52)
+            if len(reply) < 10 or reply[9] != 0:
+                raise RuntimeError(f"device rejected packet {number}: {reply.hex(' ')}")
+            if number == len(packets) or number % 25 == 0:
+                print(f"{number}/{len(packets)}")
+        print("upload completed; device acknowledged every packet")
+    finally:
+        if client:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scan", action="store_true", help="list BLE devices; no writes")
+    parser.add_argument("--address", help="BLE MAC/address")
+    parser.add_argument("--name", help="unique part of BLE name, used instead of --address")
+    parser.add_argument("--info", action="store_true", help="query E4 53 screen/MTU info; no writes beyond the query")
+    parser.add_argument("--image", help="input background image")
+    parser.add_argument("--width", type=int, help="override reported image width")
+    parser.add_argument("--height", type=int, help="override reported image height")
+    parser.add_argument("--corners", type=int, help="override reported round-corner radius")
+    parser.add_argument("--output", help="write converted RGB565 bytes here; does not use Bluetooth")
+    parser.add_argument("--send", action="store_true", help="actually change the background after info query and ACK checks")
+    parser.add_argument("--dial-type", type=int, default=1, help="app's type byte (default: 1)")
+    parser.add_argument("--text-position", type=int, default=5, help="app's time-text position byte (default: 5, as in the app)")
+    parser.add_argument("--text-colour", default="FFFF", help="RGB565 text colour, hexadecimal (default: FFFF)")
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    if args.scan:
+        asyncio.run(scan())
+        return
+    if args.output:
+        if not args.image or not args.width or not args.height:
+            raise SystemExit("--output requires --image --width and --height")
+        Path(args.output).write_bytes(rgb565_be(Path(args.image), args.width, args.height, args.corners or 0))
+        print(f"wrote {args.output}")
+        return
+    if not args.info and not args.send:
+        raise SystemExit("choose --scan, --info, --output, or --send")
+    address = asyncio.run(find_device(args.address, args.name))
+    if args.info:
+        asyncio.run(inspect(address))
+    if args.send:
+        if not args.image:
+            raise SystemExit("--send requires --image")
+        asyncio.run(upload(args, address))
+
+
+if __name__ == "__main__":
+    main()
