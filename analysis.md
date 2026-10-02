@@ -269,6 +269,42 @@ PC 実装は 240×296 BMP/RGB565 の生成と 4 KiB block / 19 packet の送信�
 バイト単位で一致することを確認済みであり、さらに任意画像での実機背景変更にも成功している。
 既定では安全側で動く。
 
+`tools/zk_background_new.c` は同じ転送方式の、読みやすさを優先した C 実装である。`get_dial_info()`
+が `E4 53` を照会し、`send_background_image()` が開始packet、4 KiB blockごとの `E4 52` 送信、ACK待機を
+順に行う。画像のデコード、中央トリミング、リサイズは扱わず、Python版 `--output` が作る時計用BMPを
+コマンドライン引数として直接受け取る。
+
+### Windows C/C++ 実行版
+
+`ble_helper.h` / `ble_helper.cpp` は、外部BLEライブラリを使わずWindows標準の C++/WinRT
+Bluetooth LE API を `zk_background_new.c` から呼べる形にした実装である。サービス、Write、Notifyの
+UUIDを固定で検出し、Notify購読、Write Without Response、通知キュー、タイムアウト待機を担当する。
+
+Visual Studio の「C++ によるデスクトップ開発」と Windows 10/11 SDK（C++/WinRT headerを含む）が
+ある場合は、次を実行する。`build_windows.bat` は通常のcmd/PowerShellからもVisual Studioの
+コンパイラ環境を自動検出する。2026-10-02にVisual Studio環境で `zk_background.exe` の生成と
+引数表示まで確認済みである。
+
+```bat
+tools\build_windows.bat
+tools\zk_background.exe image.bmp
+tools\zk_background.exe --address 41:42:E1:92:76:86 image.bmp
+```
+
+w64devkit（MinGW-w64 GCC）でもビルド対象にできる。Windows SDKのC++/WinRT headerと
+`windowsapp.lib` が必要なので、SDKを導入し、w64devkitのシェルで `WindowsSdkDir` と
+`WindowsSDKVersion` を設定した上で次を実行する。
+
+```bat
+tools\build_w64devkit.bat
+tools\zk_background.exe image.bmp
+```
+
+アドレス省略時は、実機確認に使った `41:42:E1:92:76:86` が既定値になる。`image.bmp` はPNG/JPEGではなく、
+240×296、16 bpp RGB565、70 byte BMP headerの送信payloadそのものを指定する。Python版の
+`--output image.bmp` で作成できる。C実行版は `E4 53` でframe sizeを読んでから送信し、転送失敗時は
+終了コードを非ゼロにする。
+
 - `--scan`、`--info`、`--output` は状態を変更しない。
 - 背景を書き換えるのは `--send` 指定時だけ。
 - `--send` は読み取り用 `E4 53` の結果と ACK を検証し、異常時には停止する。
