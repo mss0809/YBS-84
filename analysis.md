@@ -165,12 +165,30 @@ E4 53 02 00 02 00 F0 01 28 00 AC 00 ED 00 90 00 B2 00 14 00
 E4 51 02 00 00 E6 00 00 C8 40 00 00 DF 01 01 00 00 FF FF 00 03
 ```
 
-原因候補は画像データの転送方式 / 検証段階に絞られる。重要な修正として、アプリが
-`BleManager.write(..., data, false, ...)` に渡す `false` は **分割書込み**フラグである。
-`BleManager.A0` は `BluetoothGatt.writeCharacteristic()` を直接呼び、
-`setWriteType()` は使わない。従って Write Without Response ではなく、既定の ATT Write
-Request を使う。`zk_background.py` は `E4 53`、`E4 51`、`E4 52` を `response=True` で
-送るよう修正済みである。
+原因候補は画像データの転送方式 / 検証段階に絞られる。アプリが
+`BleManager.write(..., data, false, ...)` に渡す `false` は **分割書込み**フラグであり、
+この値そのものから ATT の書込み種別は判断できない。Windows 実機では 2026-10-02 に
+`E4 53` を `response=True`（ATT Write Request）で送ったところ、characteristic `0x0008`
+から `Protocol Error 0x03: Write Not Permitted` が返った。従って、この実機の
+`6e40fc20-…` characteristic は Write Without Response を使う必要がある。
+
+`zk_background.py` は `E4 53`、`E4 51`、`E4 52` を `response=False`（ATT Write Command）で
+送るよう訂正済みである。信頼性と順序は ATT 書込み応答ではなく、デバイスが返す
+`E4 51` / `E4 52` のアプリケーション層 ACK で確保する。
+
+同日に `response=False` へ戻して再試行した結果、`E4 53` 照会と `E4 51` ACK は再び成功し、
+時刻位置 `05` も ACK に反映された。しかし最初の `E4 52` 後には通知が一切なく、8 秒で
+タイムアウトした。よって `response=True` による拒否ではなく、最初のデータブロックを
+デバイスが受理・ACK しない問題が残っている。次のツール版では `E4 51` ACK 後に既定 250 ms
+の待機を入れ、第1パケットのヘッダと SHA-256 を `--debug` で記録できるようにした。
+
+`--start-delay 1 --debug` による追加試験でも同じ結果だった。開始 ACK は
+`E4 51 02 00 00 E6 00 00 C8 40 00 00 DF 01 01 05 00 FF FF 00 00`、送信した第1ブロックは
+長さ 237 byte、header は `E4 52 01 02 00 01 00 00 00 00 00 00 66 3C`、SHA-256 は
+`0c30d3d5b6fe50f2f8deca967c6e3aa214007d162b9db5a93e7fb0c91c183432` だった。それでも
+`E4 52` 通知は 8 秒間一切届かなかった。従って開始 ACK 後の短い初期化待ちだけでは
+解決しない。公式アプリによる背景変更の HCI snoop を取得し、実際の GATT Write と Notify を
+PC 実装と比較することが次の必須証拠となる。
 
 最初の試行は時刻文字位置 `0` も使っていた。アプリは
 `WatchFaceCustomFragment.timeTextDirection` を `5` に初期化して
@@ -180,9 +198,76 @@ Request を使う。`zk_background.py` は `E4 53`、`E4 51`、`E4 52` を `resp
 `E4` の GATT Write / Notify を含まない。公式アプリで識別しやすい画像を適用しながら
 btsnoop/logcat を取り、`E4 51` / `E4 52` を比較する必要がある。
 
+2026-10-02 に取得した `btsnoop_hci.log`（7,975 byte、196 レコード）も同様に不十分だった。
+H4 packet type は HCI Command `01` が 95 件、HCI Event `04` が 101 件であり、ACL `02` が
+0 件だった。従って ATT/GATT の payload は含まれず、公式アプリの画像転送を比較できない。
+次回は Android 開発者向けオプションの Bluetooth HCI snoop を **Full / unfiltered** にしてから
+Bluetooth を再起動し、公式アプリで背景を実際に変更した直後のログを取得する。
+
+`tools/btsnoop_e4.py` は btsnoop の ACL/L2CAP/ATT を解析し、`E4` で始まる Write Command、
+Write Request、Notification、Indication を表示する。次のログは
+`py tools/btsnoop_e4.py btsnoop_hci.log` で確認する。
+
+### 公式アプリの完全キャプチャから確定した転送方式
+
+同時に取得した `btsnoop_hci.log.filtered` は ACL を含まず、HCI Command/Event だけである。
+一方、`btsnoop_hci.log`（441,468 byte）は H4 ACL packet `02` を 1,841 件含み、公式アプリの
+カスタム文字盤転送を完全に記録している。以後はこちらを基準にする。
+
+公式アプリは対象機器へ、単純 RGB565（51,264 byte、230 packet）を送っていなかった。
+開始要求は次である。
+
+```text
+E4 51 01 00 02 7E 00 02 2B 46 00 00 DF 01 01 05 00 FF FF 00 71
+```
+
+ここで byte 4–5 は `0x027E = 638`、bytes 6–9 は `0x00022B46 = 142,150`、bytes 11–12 は
+`0x00DF = 223` である。開始 packet は 21 byte で、末尾 `00 71` は 142,150 byte のデータ
+全体に対する checksum の big-endian 値である。データ先頭は `42 4D`（ASCII `BM`）である。
+続く `46 2B 02 00` はファイルサイズ `0x00022B46 = 142,150` の little-endian 表現であり、
+これは独自コンテナではなく **BMP** である。
+
+BMP header は offset 70、DIB header は 56 byte、画像は **240×296**、16 bpp、`BI_BITFIELDS`、
+マスクは RGB565 (`F800`, `07E0`, `001F`) である。画素データは下から上へ（bottom-up）、各 RGB565
+値は little-endian で格納される。画像だけのサイズは `240 × 296 × 2 = 142,080` byte、BMP header
+70 byte を足すとキャプチャの 142,150 byte と完全に一致する。APK の
+`ImgToBmpUtil.getBin(addBMP_RGB_5652(...), width, height)` と一致し、この公式転送時には
+`DEVICE_MODE_DIAL == 2` の BMP 経路が選ばれている。
+
+公式アプリは `E4 52` を一つずつ ACK 待ちしない。223 byte を上限として BMP payload を **4,096 byte
+単位**に分け、各 4,096 byte block を 19 packet（18×223 byte + 82 byte）で連続送信してから
+ACK を待つ。最後の 2,886 byte block は 13 packet である。packet 番号は 1–659 まで連続し、
+progress はこの 659 を分母に計算される。開始 packet の 638 とは一致しないが、機器は受理する。
+
+各 block 内で `E4 52` の bytes 6–9 の offset は 0 から再開する。末尾 packet は 237 byte に
+ゼロ埋めせず、実際の長さだけを送る。byte 11（final flag）は全 659 packet で `00` だった。
+ACK は 19、38、57、…、646、659 packet 後に届き、形式は例えば
+`E4 52 02 02 00 13 00 00 00 00` である。byte 9 のゼロは成功を表す。
+
+この差により、旧 PC ツールが第1 packet の直後に ACK を待って 0% で止まった理由が説明できる。
+PC 実装は 240×296 BMP/RGB565 の生成と 4 KiB block / 19 packet の送信スケジューリングへ
+修正した。
+
+### PC 実装による実機確認（2026-10-02）
+
+`41:42:E1:92:76:86` に対して、PC から任意の `background.png` を変換・送信し、背景変更が
+**成功した**。従って、次は実機で確認済みである。
+
+- `E4 53` で得る MTU 237 に対し、`E4 52` の payload 上限を 223 byte とする。
+- 入力画像を 240×296 に中央トリミング・拡大縮小し、bottom-up / little-endian RGB565 の BMP にする。
+- 21 byte の `E4 51` 開始 packet には payload 全体の加算 checksum を入れる。
+- 各 4,096 byte block の packet を連続送信し、block ごとの `E4 52` 成功通知（byte 9 = `00`）を待つ。
+- `E4 52` bytes 12–13 は payload の送信開始からの累積加算 checksum である。
+
+よって、この機種のカスタム背景は PC の Python ツールだけで変更可能である。これは背景領域への
+書込みを伴う操作なので、接続中の公式アプリを終了し、電池残量を確保した状態で行う。
+
 ## PC ツール
 
-`tools/zk_background.py` は上記単純経路の Python 実装。既定では安全側で動く。
+`tools/zk_background.py` は、完全キャプチャで確定した BMP/RGB565・4 KiB block 経路の Python 実装。
+公式転送の開始 packet と全659個の `E4 52` packet は、キャプチャから再構成した payload を入力して
+バイト単位で一致することを確認済みであり、さらに任意画像での実機背景変更にも成功している。
+既定では安全側で動く。
 
 - `--scan`、`--info`、`--output` は状態を変更しない。
 - 背景を書き換えるのは `--send` 指定時だけ。
@@ -193,9 +278,15 @@ btsnoop/logcat を取り、`E4 51` / `E4 52` を比較する必要がある。
 py -m pip install -r tools/requirements.txt
 py tools/zk_background.py --scan
 py tools/zk_background.py --address AA:BB:CC:DD:EE:FF --info
-py tools/zk_background.py --image background.png --width 240 --height 280 --output background.rgb565
+py tools/btsnoop_e4.py btsnoop_hci.log --quiet --extract-payload official-background.bmp
+py tools/zk_background.py --image background.png --output background.bmp
 py tools/zk_background.py --address AA:BB:CC:DD:EE:FF --image background.png --send
 ```
+
+`btsnoop_hci.log.filtered` は ACL/GATT payload を含まないため、`--extract-payload` の入力に使えない。
+最初の送信試験は、画像変換要因を除外するため、公式ログから抽出した `official-background.bmp` を
+`--payload official-background.bmp --send` として使う。背景を公式アプリで適用済みの画像に戻すだけで
+あることを確認してから実行する。
 
 PC 接続前に Android アプリを切断または強制終了し、`--info` の結果が公式アプリと一致する
 ことを確認する。
