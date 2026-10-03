@@ -1,2 +1,5 @@
 app_code/
 firmware_samples/
+
+# Ignore Bluetooth snoop logs
+btsnoop_hci.log*
