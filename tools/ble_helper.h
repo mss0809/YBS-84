@@ -28,6 +28,15 @@ int ble_helper_wait_notification(void *user, uint8_t expected_command,
                                  uint8_t *out, size_t out_capacity, size_t *out_len,
                                  uint32_t timeout_ms);
 
+/*
+ * 指定したプレフィックスで始まる Notify を待つ。無関係な通知は破棄せず
+ * キューに残す。成功時は value 全体を out にコピーし、out_len を設定する。
+ */
+int ble_helper_wait_notification_prefix(void *user, const uint8_t *prefix, size_t prefix_len,
+                                        uint8_t *out, size_t out_capacity, size_t *out_len,
+                                        uint32_t timeout_ms);
+
+
 /* 転送のパケット間待機に使う。 */
 void ble_helper_sleep_ms(void *user, uint32_t milliseconds);
 

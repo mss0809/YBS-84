@@ -235,6 +235,39 @@ extern "C" int ble_helper_wait_notification(void *user, uint8_t expected_command
     }
 }
 
+extern "C" int ble_helper_wait_notification_prefix(void *user, const uint8_t *prefix, size_t prefix_len,
+                                              uint8_t *out, size_t out_capacity, size_t *out_len,
+                                              uint32_t timeout_ms) {
+    auto *helper = static_cast<zk_ble_helper *>(user);
+    if (helper == nullptr || out == nullptr || out_len == nullptr || prefix == nullptr || prefix_len == 0) {
+        return -1;
+    }
+
+    std::unique_lock<std::mutex> lock(helper->mutex);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;) {
+        const auto it = std::find_if(helper->notifications.begin(), helper->notifications.end(),
+            [prefix, prefix_len](const std::vector<uint8_t> &value) {
+                if (value.size() < prefix_len) return false;
+                return std::equal(prefix, prefix + prefix_len, value.begin());
+            });
+        if (it != helper->notifications.end()) {
+            if (it->size() > out_capacity) {
+                helper->last_error = "通知バッファが小さすぎます";
+                return -2;
+            }
+            memcpy(out, it->data(), it->size());
+            *out_len = it->size();
+            helper->notifications.erase(it);
+            return 0;
+        }
+        if (helper->notification_ready.wait_until(lock, deadline) == std::cv_status::timeout) {
+            helper->last_error = "Notify待機がタイムアウトしました";
+            return -3;
+        }
+    }
+}
+
 extern "C" void ble_helper_sleep_ms(void *, uint32_t milliseconds) {
     Sleep(milliseconds);
 }

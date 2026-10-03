@@ -375,6 +375,9 @@ PC 接続前に Android アプリを切断または強制終了し、`--info` �
 | ZK 通知 | `23 packet_index notification_type payload:utf8[≤17]`。最終短縮ブロックは `FF` 終端、満杯の最終ブロックには `23 last_index notification_type FF` を追加。 |
 | カメラ制御の有効化 | `52 enable` |
 
+※ **`notification_type` の補足**: 画像自体は転送されず、機器内蔵のアイコンを使用する。`NotificationMonitor.java` によりパッケージ名から以下のIDに変換され指定される。
+(1=SMS, 2=WeChat, 3=QQ, 4=DingTalk, 5=WhatsApp, 6=Facebook, 7=Twitter, 8=Other)
+
 機器からの `53 state` はスマートフォン探索、`55 01` / `55 02` は通話の拒否 / 応答、`A2`
 は Android の撮影要求である。これらは PC では要求への応答でなく非同期イベントとして扱う。
 
@@ -422,7 +425,7 @@ PC 接続前に Android アプリを切断または強制終了し、`--info` �
 | 最大音量 | `FB 08 00 06 09 01` |
 
 設定は `FB subcommand 01 total_length payload checksum_le16`。例: ANC は
-`FB 05 01 07 value sum_lo sum_hi`。音声モードと最大音量も subcommand `07` / `08` の
+`FB 05 01 07 value sum_lo sum_hi`。イヤホン/スピーカー探索は `FB 06 01 07 value sum_lo sum_hi`。音声モードと最大音量も subcommand `07` / `08` の
 同じ 7 byte 形式。checksum byte がゼロの状態で全体を加算し、low byte を先に保存する。
 big-endian の `E4 52` checksum とは異なる。
 
