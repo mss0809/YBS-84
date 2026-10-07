@@ -378,8 +378,96 @@ PC 接続前に Android アプリを切断または強制終了し、`--info` �
 ※ **`notification_type` の補足**: 画像自体は転送されず、機器内蔵のアイコンを使用する。`NotificationMonitor.java` によりパッケージ名から以下のIDに変換され指定される。
 (1=SMS, 2=WeChat, 3=QQ, 4=DingTalk, 5=WhatsApp, 6=Facebook, 7=Twitter, 8=Other)
 
+`tools/send_message/send_message.exe` は `--icon` でこのIDを指定できる。アイコン名
+(`sms`、`wechat`、`qq`、`dingtalk`、`whatsapp`、`facebook`、`twitter`、`other`) または `1`–`8`
+を使う。既定値は `sms`（ID 1）。例:
+
+```bat
+send_message.exe --icon whatsapp --message "Hello"
+send_message.exe --icon 8 --message "Other notification"
+```
+
+#### ZK 通知の文字コード
+
+`FreeFitDevice.sendMessageByZk()` は、通知本文を **明示的に UTF-8** へ変換してから
+`23 index type ...` の payload に入れている。
+
+```java
+byte[] bytes = str.getBytes(StandardCharsets.UTF_8);
+```
+
+したがって、ZK 通知 (`23`) の経路には GBK、GB2312、Shift-JIS、CP932 などへ変換する
+処理は見つからなかった。通常通知 (`73`) の `sendMessage()` も同じ UTF-8 変換を使う。
+アプリは `NotificationMonitor.getData()` / `getDataNoEnd()` でも UTF-8 のバイト数で文字列を
+切り詰めており、文字数ではなく送信バイト数を意識している。
+
+アプリ内には `ByteUtil.chatTo16bitUnicodeWithBytes()` という UTF-16 の `char` を 2 byte に
+する補助関数がある。ただし、これは音楽タイトル、機器名など別コマンドのための処理であり、
+`sendMessageByZk()` / `sendMessage()` からは使われない。音楽同期部に見つかる UTF-16LE 指定も
+通知とは無関係である。
+
+注意点として、公式アプリも payload を 17 byte ごとに機械的に分割する。そのため UTF-8 の
+3 byte 文字が packet 境界をまたぐことはあり得るが、全 packet を再結合してから復号する実装なら
+正しい UTF-8 になる。短い最終 packet には `FF` を付加し、17 byte ちょうどで終わる場合は
+`23 last_index type FF` を別途送る。
+
+`send_message.exe` で日本語が表示されないという観測だけでは、時計が UTF-8 非対応とは断定
+できない。現行 C ツールは `main(int, char **)` の `argv` を `strlen` / `memcpy` でそのまま送る。
+Windows ではこの `argv` はプロセス開始時の ANSI コードページ（日本語環境では通常 CP932）で
+生成され、プログラム開始後の `SetConsoleCP(CP_UTF8)` は既に生成済みの `argv` を UTF-8 に
+変換しない。従って例えば `あ` を指定しても、期待する UTF-8 の `E3 81 82` ではなく CP932 の
+`82 A0` を送っている可能性が高い。
+
+`tools/send_message/send_message.c` はこの問題を避けるため、`wmain(int, wchar_t **)` で
+UTF-16 の Windows コマンドラインを受け、`WideCharToMultiByte(CP_UTF8, ...)` で本文を
+UTF-8 化してから送るよう変更した。全送信 packet を16進表示するので、例えば `--message "あ"`
+なら `23 00 <icon> E3 81 82 FF` が出力されることを確認する。これを実際に送ってなお日本語が
+表示されなければ、対象ファームウェアの UTF-8 デコーダまたは日本語フォントが未搭載である
+可能性が高い。公式アプリが UTF-8 を採用していることは、少なくとも APK が対象にする一部の
+機種では UTF-8 通知を想定していることを示すが、AB5691E 搭載のこの個体での対応を保証しない。
+
 機器からの `53 state` はスマートフォン探索、`55 01` / `55 02` は通話の拒否 / 応答、`A2`
 は Android の撮影要求である。これらは PC では要求への応答でなく非同期イベントとして扱う。
+
+#### 実機確認: 日本語と通知アイコン
+
+PC ツールを `wmain` + `WideCharToMultiByte(CP_UTF8, ...)` に変更した後、任意の日本語文字が
+実機上で正しく表示できることを確認した。従って本個体の通知本文は UTF-8 を受け取れる。
+
+APK の `NotificationMonitor.getNotificationFlag()` は `23` packet の種別を
+`1=SMS, 2=WeChat, 3=QQ, 4=DingTalk, 5=WhatsApp, 6=Facebook, 7=Twitter, 8=Other`
+としているため、`send_message.exe --icon` の ID 割当は公式アプリと一致する。
+しかし実機では ID 1 の通知だけが表示され、ID 2–8 では表示されなかった。これは PC ツールの
+ID 指定誤りではない。
+
+その後、公式アプリで Android の「通知へのアクセス」を許可すると ID 2–8 の PC 送信も表示された。
+この挙動は、機器側に通知種別の有効状態が保存されているという仮説と整合する。
+
+APK の実装を区別すると、Android の許可操作そのものは BLE 設定ではない。
+`NoticeSettingActivity.onResume()` は許可後に `NotificationMonitor` コンポーネントを無効→有効へ
+切り替えるだけであり、BLE の `sendData` / `configDeviceSettings` を呼ばない。一方、通知設定画面の
+各スイッチを操作すると `sendCommand()` が必ず `FreeFitDevice.configDeviceSettings()` を呼び、次の
+22 byte packet を機器へ送る。
+
+```text
+02 02 skype line sedentary_interval sedentary_enable call sms wechat qq
+      kakao facebook twitter whatsapp linkedin hr raise hr_loop hr_interval
+      instagram other zalo_and_messenger
+```
+
+従って、許可画面を開く前後で通知スイッチの初期化・操作・全体スイッチ操作が起き、この packet が
+同期された可能性が高い。PC 側でこれを再現する場合は、全22 byteを不用意に固定値で送ると着信、
+座り過ぎ、心拍、挙手点灯などの既存設定も上書きする。
+
+`tools/send_message/send_message.exe` には `--enable-notification-icons` を追加した。
+明示指定した時だけ、上記 packet で SMS、WeChat、QQ、KakaoTalk、Facebook、Twitter、WhatsApp、
+LinkedIn、Instagram、Other、Zalo、Messenger と着信通知を有効にする。DingTalk は個別の設定欄が
+ないため Other を使用する。この packet は通知以外の同居項目（座り過ぎ、心拍、挙手点灯等）を
+`0` に再設定するため、既存設定を維持したい場合は公式アプリ側で通知を有効にすることを優先する。
+
+```bat
+send_message.exe --enable-notification-icons --icon whatsapp --message "テスト"
+```
 
 ### 健康、活動、スポーツ
 
@@ -428,6 +516,18 @@ PC 接続前に Android アプリを切断または強制終了し、`--info` �
 `FB 05 01 07 value sum_lo sum_hi`。イヤホン/スピーカー探索は `FB 06 01 07 value sum_lo sum_hi`。音声モードと最大音量も subcommand `07` / `08` の
 同じ 7 byte 形式。checksum byte がゼロの状態で全体を加算し、low byte を先に保存する。
 big-endian の `E4 52` checksum とは異なる。
+
+`tools/find_speaker/find_speaker.exe` が開始時に送る `FB 06 01 07 01 0A 01` は、公式アプリの
+`FreeFitDevice.findHeadphones(1)` と一致する。アプリは機器の能力応答 `83` の byte 18 bit 1 を
+`IS_SUPPORT_FIND_HEADPHONES` として扱うため、この bit が立っていれば少なくとも対象機器が
+探索コマンドをサポートすると申告していることになる。さらに `FindHeadphonesActivity` に実際の
+開始・停止、応答処理が実装されているため、単に不要なコードとして切り捨てるべきではない。
+
+ただし APK は複数製品共通なので、アプリ本体に画面とコマンドがあることだけではこの個体での実装を
+保証しない。`FB 06` 応答の有無と `83` の byte 18 bit 1 を実機で確認して判断する。
+アプリの画面処理では応答の byte 4 が `01` なら探索中、`00` なら停止、`02` なら「先にペアリング
+してください」としている。ツールは送信 packet と、最大 2 秒待った `FB 06` 応答を表示するようにした。
+さらに開始前に `03 00` の能力照会を行い、`83` 応答の byte 18 bit 1 を表示する。
 
 ### PC デコーダ向け応答マップ
 

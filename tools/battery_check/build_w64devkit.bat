@@ -6,8 +6,6 @@ where gcc >nul 2>nul
 if errorlevel 1 goto :no_gcc
 where g++ >nul 2>nul
 if errorlevel 1 goto :no_gcc
-
-rem C++/WinRT headers and windowsapp.lib come from the Windows SDK.
 if not defined WindowsSdkDir goto :no_sdk_root
 if not defined WindowsSDKVersion goto :no_sdk_version
 
@@ -16,26 +14,23 @@ set "WINSDK_UM_LIB=%WindowsSdkDir%Lib\%WindowsSDKVersion%um\x64"
 if not exist "%CPPWINRT_INCLUDE%\winrt\base.h" goto :no_cppwinrt
 if not exist "%WINSDK_UM_LIB%\windowsapp.lib" goto :no_windowsapp
 
-gcc -std=c11 -Wall -Wextra -Wpedantic -I.. -c zk_background_new.c -o zk_background_new.o
+gcc -std=c11 -Wall -Wextra -Wpedantic -c battery_check.c -o battery_check.o
 if errorlevel 1 goto :failed
 g++ -std=c++20 -Wall -Wextra -Wpedantic -I"%CPPWINRT_INCLUDE%" -c ..\ble_helper.cpp -o ble_helper.o
 if errorlevel 1 goto :failed
-g++ -o zk_background.exe zk_background_new.o ble_helper.o -L"%WINSDK_UM_LIB%" -lwindowsapp -lruntimeobject -lole32 -lbthprops
+g++ -o battery_check.exe battery_check.o ble_helper.o -L"%WINSDK_UM_LIB%" -lwindowsapp -lruntimeobject -lole32 -lbthprops
 if errorlevel 1 goto :failed
 
-echo Build succeeded: %CD%\zk_background.exe
+echo Build succeeded: %CD%\battery_check.exe
 exit /b 0
-
 :no_gcc
 echo ERROR: gcc or g++ was not found. Run this script inside the w64devkit shell.
 exit /b 1
 :no_sdk_root
 echo ERROR: WindowsSdkDir is not set.
-echo Example: set "WindowsSdkDir=C:\Program Files (x86)\Windows Kits\10\"
 exit /b 1
 :no_sdk_version
 echo ERROR: WindowsSDKVersion is not set.
-echo Example: set "WindowsSDKVersion=10.0.26100.0\"
 exit /b 1
 :no_cppwinrt
 echo ERROR: C++/WinRT headers were not found at "%CPPWINRT_INCLUDE%".
